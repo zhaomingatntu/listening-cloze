@@ -49,25 +49,7 @@ async function fbLoad(url) {
 }
 async function fbSave(url, data) { await fbPut(url, "lce", data); }
 
-// ── Claude API ────────────────────────────────────────────────────
-async function apiTranslate(sentences) {
-  const r = await fetch("https://api.anthropic.com/v1/messages", {
-    method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({
-      model: MODEL, max_tokens: 1000,
-      system: "Respond ONLY with a raw JSON array of strings. No markdown, no code fences.",
-      messages:[{role:"user",content:
-        `Translate each English sentence into Traditional Chinese (繁體中文). Return ONLY a JSON array.\n${sentences.map((s,i)=>`${i+1}. ${s}`).join("\n")}`
-      }]
-    })
-  });
-  if (!r.ok) throw new Error(`API HTTP ${r.status}`);
-  const d = await r.json();
-  if (d.error) throw new Error(d.error.message);
-  const txt = (d.content[0]?.text||"[]").replace(/```json|```/g,"").trim();
-  const s = txt.indexOf("["), e = txt.lastIndexOf("]");
-  return s!==-1 ? JSON.parse(txt.slice(s,e+1)) : [];
-}
+// No Claude API needed — translations entered manually by teacher
 
 // ── Helpers ───────────────────────────────────────────────────────
 const splitSentences = txt =>
@@ -379,8 +361,8 @@ function TeacherArea({classes,updCls,exercises,updEx,auth,updAuth}) {
   const [newCls,setNewCls]       = useState("");
   const [exName,setExName]       = useState("");
   const [passage,setPassage]     = useState("");
+  const [transText,setTransText] = useState("");
   const [preview,setPreview]     = useState(null);
-  const [busy,setBusy]           = useState(false);
   const [err,setErr]             = useState("");
 
   const login = async () => {
@@ -426,17 +408,16 @@ function TeacherArea({classes,updCls,exercises,updEx,auth,updAuth}) {
   );
 
   const addCls=()=>{ if(newCls.trim()&&!classes.includes(newCls.trim())){updCls([...classes,newCls.trim()]);setNewCls("");} };
-  const process=async()=>{
-    if(!exName.trim()||!passage.trim()) return;
-    setBusy(true);setErr("");setPreview(null);
-    try{ const sents=splitSentences(passage); const trans=await apiTranslate(sents);
-      setPreview(sents.map((s,i)=>({text:s,translation:trans[i]||""})));
-    }catch(e){setErr("翻譯失敗: "+e.message);}
-    setBusy(false);
+  const process = () => {
+    if (!exName.trim() || !passage.trim()) { setErr("請輸入練習名稱和文章。"); return; }
+    const sents = splitSentences(passage);
+    const transLines = transText.split("\n").map(l => l.trim());
+    setPreview(sents.map((s, i) => ({ text: s, translation: transLines[i] || "" })));
+    setErr("");
   };
   const saveEx=()=>{ if(!preview) return;
     updEx([...exercises,{id:Date.now().toString(),name:exName.trim(),sentences:preview,available:true}]);
-    setExName("");setPassage("");setPreview(null); };
+    setExName("");setPassage("");setTransText("");setPreview(null); };
   const toggleEx=id=>updEx(exercises.map(e=>e.id===id?{...e,available:!e.available}:e));
   const deleteEx=id=>updEx(exercises.filter(e=>e.id!==id));
   const updatePrev=(i,f,v)=>{const p=[...preview];p[i]={...p[i],[f]:v};setPreview(p);};
@@ -502,11 +483,14 @@ function TeacherArea({classes,updCls,exercises,updEx,auth,updAuth}) {
             <div style={{fontWeight:"600",marginBottom:10}}>➕ 新增練習 Create New Exercise</div>
             <input value={exName} onChange={e=>setExName(e.target.value)} placeholder="練習名稱 Exercise name"
               style={{display:"block",width:"100%",padding:"8px 12px",borderRadius:6,border:"1px solid #d1d5db",fontSize:14,marginBottom:8,boxSizing:"border-box"}}/>
-            <textarea value={passage} onChange={e=>setPassage(e.target.value)} rows={5} placeholder="貼入文章 Paste passage…"
-              style={{display:"block",width:"100%",padding:"8px 12px",borderRadius:6,border:"1px solid #d1d5db",fontSize:14,marginBottom:8,resize:"vertical",boxSizing:"border-box"}}/>
-            <button onClick={process} disabled={busy||!exName.trim()||!passage.trim()}
-              style={{...B(busy?"#9ca3af":"#4f46e5"),cursor:busy?"not-allowed":"pointer"}}>
-              {busy?"⏳ 翻譯中 Translating…":"🔄 分句並翻譯 Process & Translate"}
+            <textarea value={passage} onChange={e=>setPassage(e.target.value)} rows={5} placeholder="貼入英文文章 Paste English passage…"
+              style={{display:"block",width:"100%",padding:"8px 12px",borderRadius:6,border:"1px solid #d1d5db",fontSize:14,marginBottom:4,resize:"vertical",boxSizing:"border-box"}}/>
+            <div style={{fontSize:12,color:"#6b7280",marginBottom:4}}>中文翻譯（每行對應一句）Chinese translations — one line per sentence:</div>
+            <textarea value={transText} onChange={e=>setTransText(e.target.value)} rows={5} placeholder={"第一句的中文翻譯\n第二句的中文翻譯\n第三句的中文翻譯…"}
+              style={{display:"block",width:"100%",padding:"8px 12px",borderRadius:6,border:"1px solid #fde68a",background:"#fefce8",fontSize:14,marginBottom:8,resize:"vertical",boxSizing:"border-box",color:"#92400e"}}/>
+            <button onClick={process} disabled={!exName.trim()||!passage.trim()}
+              style={{...B(!exName.trim()||!passage.trim()?"#9ca3af":"#4f46e5"),cursor:!exName.trim()||!passage.trim()?"not-allowed":"pointer"}}>
+              🔍 預覽分句 Preview Sentences
             </button>
             {err&&<div style={{color:"#dc2626",fontSize:13,marginTop:8}}>{err}</div>}
           </div>
