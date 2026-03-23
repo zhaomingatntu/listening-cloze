@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>聽力填空練習 Listening Cloze</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.3/babel.min.js"></script>
+<style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:"Segoe UI",system-ui,sans-serif;background:#f1f5f9;}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ── CONFIG — paste your Firebase DB URL here as fallback ──────────
+const DEFAULT_DB = ""; // e.g. "https://your-project-default-rtdb.asia-southeast1.firebasedatabase.app"
+const TEACHER_PW = "teacher123";
+const MODEL = "claude-sonnet-4-20250514";
+
+// ── Firebase REST ─────────────────────────────────────────────────
+function getDbUrl() {
+  try { return new URLSearchParams(window.location.hash.slice(1)).get("db") || DEFAULT_DB || null; }
+  catch { return DEFAULT_DB || null; }
+}
+function setDbUrlHash(url) { window.location.hash = "db=" + encodeURIComponent(url); }
+
+async function fbLoad(url) {
+  const r = await fetch(`${url}/lce.json`);
+  if (!r.ok) throw new Error(`HTTP ${r.status} — check Firebase Rules (set read/write to true)`);
+  return (await r.json()) || { classes:[], exercises:[], logs:[] };
+}
+async function fbSave(url, data) {
+  const r = await fetch(`${url}/lce.json`, {
+    method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify(data)
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status} — check Firebase write rules`);
+}
+
+// ── Claude API ────────────────────────────────────────────────────
+async function apiTranslate(sentences) {
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({
+      model: MODEL, max_tokens: 1000,
+      system: "Respond ONLY with a raw JSON array of strings. No markdown, no code fences.",
+      messages:[{role:"user",content:
+        `Translate each English sentence into Traditional Chinese (繁體中文). Return ONLY a JSON array.\n${sentences.map((s,i)=>`${i+1}. ${s}`).join("\n")}`
+      }]
+    })
+  });
+  if (!r.ok) throw new Error(`API error HTTP ${r.status}`);
+  const d = await r.json();
+  if (d.error) throw new Error(d.error.message);
+  const txt = (d.content[0]?.text||"[]").replace(/```json|```/g,"").trim();
+  const s = txt.indexOf("["), e = txt.lastIndexOf("]");
+  return s!==-1 ? JSON.parse(txt.slice(s,e+1)) : [];
+}
+
+// ── Helpers ───────────────────────────────────────────────────────
+const splitSentences = txt =>
+  (txt.replace(/\n+/g," ").match(/[^.!?]+(?:[.!?]+["']?\s*|$)/g)||[txt]).map(s=>s.trim()).filter(Boolean);
+
+const tokenize = str => {
+  const tokens=[]; const re=/(\w[\w''-]*|[^\w\s]+)/g; let m;
+  while((m=re.exec(str))!==null) tokens.push({val:m[0],isWord:/\w/.test(m[0])});
+  return tokens;
+};
+const normalize = s => s.trim().toLowerCase().replace(/[^\w''-]/g,"");
+
+const B = (bg="#4f46e5",extra={}) => ({
+  padding:"8px 16px",background:bg,color:"#fff",border:"none",
+  borderRadius:6,cursor:"pointer",fontSize:14,...extra
+});
+const CARD = {border:"1px solid #e2e8f0",borderRadius:8,padding:"12px 14px",marginBottom:10};
+
+// ═══════════════════════════════════════════════════════════════════
+// SETUP SCREEN
+// ═══════════════════════════════════════════════════════════════════
+function SetupScreen({onReady}) {
+  const [dbInput,setDbInput]=useState(""); const [loading,setLoading]=useState(false);
+  const [err,setErr]=useState(""); const [diagLog,setDiagLog]=useState([]);
+  const log = msg => setDiagLog(p=>[...p,msg]);
+
+  async function connect() {
+    let url = dbInput.trim().replace(/\s+/g,"").replace(/\/+$/,"").split("?")[0].split("#")[0];
+    setErr(""); setDiagLog([]);
+    if (!url) { setErr("Please enter your Firebase database URL."); return; }
+    if (!url.startsWith("https://")) { setErr("URL must start with https://"); return; }
+    setLoading(true);
+    log(`🔍 Fetching: ${url}/lce.json`);
+    let r;
+    try { r = await fetch(`${url}/lce.json`); log(`✅ HTTP ${r.status} ${r.statusText}`); }
+    catch(e) {
+      log(`❌ Network error: ${e.message}`);
+      log(`ℹ️  Fix: Firebase Console → Realtime Database → Rules → set read & write to true → Publish`);
+      setErr("Failed to reach Firebase. See diagnostics below."); setLoading(false); return;
+    }
+    if (r.status===401||r.status===403) {
+      log(`❌ Permission denied — update Firebase Rules to allow read/write.`);
+      setErr(`Permission denied (HTTP ${r.status}).`); setLoading(false); return;
+    }
+    if (!r.ok) { log(`❌ HTTP ${r.status}`); setErr(`HTTP ${r.status} error.`); setLoading(false); return; }
+    let existing;
+    try { existing=await r.json(); log(`✅ Response parsed OK`); }
+    catch(e) { log(`❌ Invalid JSON: ${e.message}`); setErr("Invalid response."); setLoading(false); return; }
+    if (!existing) {
+      log(`ℹ️  Empty database — initialising…`);
+      try { await fbSave(url,{classes:[],exercises:[],logs:[]}); log(`✅ Initialised`); }
+      catch(e) { log(`❌ Write failed: ${e.message}`); setErr("Read OK but write failed."); setLoading(false); return; }
+    } else { log(`✅ Existing data found`); }
+    log(`🚀 Launching…`);
+    setDbUrlHash(url); onReady(url); setLoading(false);
+  }
+
+  const inp = {display:"block",width:"100%",padding:"10px 12px",borderRadius:8,border:"1px solid #d1d5db",fontSize:14,marginBottom:8};
+  return (
+    <div style={{minHeight:"100vh",background:"linear-gradient(135deg,#eef2ff,#f1f5f9)",display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
+      <div style={{background:"#fff",borderRadius:16,boxShadow:"0 8px 32px rgba(0,0,0,.1)",padding:36,maxWidth:500,width:"100%"}}>
+        <div style={{textAlign:"center",marginBottom:24}}>
+          <div style={{fontSize:52,marginBottom:8}}>🎧</div>
+          <h1 style={{color:"#1e1b4b",fontSize:22,marginBottom:4}}>聽力填空練習</h1>
+          <p style={{color:"#6b7280",fontSize:13}}>Listening Cloze Exercise · 連結 Firebase 儲存</p>
+        </div>
+        <div style={{background:"#eff6ff",border:"1px solid #bfdbfe",borderRadius:12,padding:16,marginBottom:20,fontSize:13,color:"#1e40af"}}>
+          <p style={{fontWeight:"700",marginBottom:10}}>📋 Firebase setup (~3 min, free):</p>
+          {[
+            <span>Go to <a href="https://console.firebase.google.com" target="_blank" style={{color:"#1d4ed8",fontWeight:600}}>console.firebase.google.com</a> → Create a project</span>,
+            <span>Left sidebar → <strong>Build → Realtime Database → Create Database</strong></span>,
+            <span>Choose any region → <strong>Start in Test mode</strong></span>,
+            <span>Copy the DB URL (e.g. <code style={{background:"#dbeafe",padding:"1px 5px",borderRadius:3}}>https://xxx-default-rtdb.firebaseio.com</code>)</span>,
+            <span>Paste below and click Connect</span>
+          ].map((s,i)=>(
+            <div key={i} style={{display:"flex",gap:10,marginBottom:6}}>
+              <span style={{fontWeight:"700",color:"#3b82f6",minWidth:18}}>{i+1}.</span><span>{s}</span>
+            </div>
+          ))}
+          <p style={{marginTop:8,color:"#1e40af",fontWeight:600}}>⚠️ If test mode expires: Rules tab → set ".read":true, ".write":true → Publish</p>
+        </div>
+        <input value={dbInput} onChange={e=>{setDbInput(e.target.value);setErr("");}}
+          onKeyDown={e=>e.key==="Enter"&&connect()}
+          placeholder="https://your-project-default-rtdb.firebaseio.com"
+          style={inp}/>
+        {err&&<div style={{color:"#dc2626",fontSize:13,marginBottom:8,padding:"8px 10px",background:"#fef2f2",borderRadius:6,border:"1px solid #fca5a5"}}>{err}</div>}
+        <button onClick={connect} disabled={loading}
+          style={{...B(loading?"#9ca3af":"#4f46e5"),width:"100%",padding:11,fontSize:15,cursor:loading?"not-allowed":"pointer"}}>
+          {loading?"⏳ Connecting…":"🔗 Connect & Launch"}
+        </button>
+        {diagLog.length>0&&(
+          <div style={{marginTop:12,background:"#0f172a",borderRadius:8,padding:"10px 14px",fontFamily:"monospace",fontSize:12,lineHeight:1.8}}>
+            {diagLog.map((l,i)=>(
+              <div key={i} style={{color:l.startsWith("❌")?"#f87171":l.startsWith("✅")||l.startsWith("🚀")?"#86efac":"#94a3b8"}}>{l}</div>
+            ))}
+          </div>
+        )}
+        <p style={{fontSize:12,color:"#9ca3af",textAlign:"center",marginTop:10}}>
+          Bookmark the URL after connecting — share it with students to use the same database.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// ROOT APP
+// ═══════════════════════════════════════════════════════════════════
+function App() {
+  const [dbUrl,setDbUrlState]=useState(getDbUrl);
+  const [db,setDb]=useState(null); const [tab,setTab]=useState("student");
+  const [saving,setSaving]=useState(false); const [saveErr,setSaveErr]=useState("");
+  const timer=useRef(null);
+
+  useEffect(()=>{
+    if(!dbUrl) return;
+    fbLoad(dbUrl).then(setDb).catch(e=>setSaveErr("Load error: "+e.message));
+  },[dbUrl]);
+
+  const persist = useCallback((newDb)=>{
+    if(!dbUrl) return;
+    if(timer.current) clearTimeout(timer.current);
+    timer.current=setTimeout(async()=>{
+      setSaving(true); setSaveErr("");
+      try { await fbSave(dbUrl,newDb); }
+      catch(e) { setSaveErr("⚠️ Save failed: "+e.message); }
+      setSaving(false);
+    },600);
+  },[dbUrl]);
+
+  const updateDb = useCallback((fn)=>{
+    setDb(prev=>{ const next=fn(prev); persist(next); return next; });
+  },[persist]);
+
+  if (!dbUrl) return <SetupScreen onReady={url=>{setDbUrlHash(url);setDbUrlState(url);}}/>;
+  if (!db) return (
+    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"#f8fafc"}}>
+      <div style={{textAlign:"center"}}>
+        <div style={{fontSize:48,marginBottom:12}}>⏳</div>
+        <p style={{color:"#6b7280"}}>載入中 Loading…</p>
+        {saveErr&&<p style={{color:"#dc2626",fontSize:13,marginTop:8,maxWidth:320,margin:"8px auto 0"}}>{saveErr}</p>}
+      </div>
+    </div>
+  );
+
+  const {classes=[],exercises=[],logs=[]} = db;
+  const updCls = c => updateDb(d=>({...d,classes:c}));
+  const updEx  = e => updateDb(d=>({...d,exercises:e}));
+  const addLog = entry => updateDb(d=>({...d,logs:[entry,...(d.logs||[])]}));
+
+  const TABS=[["student","🎓 學生區"],["teacher","👩‍🏫 教師區"],["logs","📊 學習記錄"]];
+  return (
+    <div style={{maxWidth:780,margin:"0 auto",padding:"16px 14px 48px"}}>
+      <div style={{textAlign:"center",marginBottom:18}}>
+        <h2 style={{margin:0,color:"#1e1b4b",fontSize:22}}>聽力填空練習</h2>
+        <div style={{color:"#6b7280",fontSize:13}}>Listening Cloze Exercise App</div>
+        {saving&&<div style={{fontSize:11,color:"#6366f1",marginTop:4}}>💾 儲存中…</div>}
+        {saveErr&&<div style={{fontSize:11,color:"#dc2626",marginTop:4}}>{saveErr}</div>}
+      </div>
+      <div style={{display:"flex",background:"#f1f5f9",borderRadius:8,padding:4,marginBottom:22}}>
+        {TABS.map(([k,l])=>(
+          <button key={k} onClick={()=>setTab(k)} style={{flex:1,padding:"9px 0",border:"none",borderRadius:6,cursor:"pointer",
+            background:tab===k?"#4f46e5":"transparent",color:tab===k?"#fff":"#374151",
+            fontWeight:tab===k?"700":"400",fontSize:14,transition:"all .15s"}}>{l}</button>
+        ))}
+      </div>
+      {tab==="student"&&<StudentArea classes={classes} exercises={exercises} addLog={addLog}/>}
+      {tab==="teacher"&&<TeacherArea classes={classes} updCls={updCls} exercises={exercises} updEx={updEx}/>}
+      {tab==="logs"&&<LogsArea logs={logs}/>}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// STUDENT AREA
+// ═══════════════════════════════════════════════════════════════════
+function StudentArea({classes,exercises,addLog}) {
+  const [cls,setCls]=useState(""); const [sid,setSid]=useState(""); const [activeEx,setActiveEx]=useState(null);
+  const available=exercises.filter(e=>e.available);
+  if(activeEx) return (
+    <ExercisePlayer exercise={activeEx}
+      onFinish={score=>{
+        if(sid.trim()) addLog({classId:cls||"—",studentId:sid.trim(),exerciseName:activeEx.name,
+          timestamp:new Date().toLocaleString("zh-TW",{hour12:false}),score});
+        setActiveEx(null);
+      }}
+      onBack={()=>setActiveEx(null)}/>
+  );
+  return (
+    <div>
+      <div style={{...CARD,background:"#f8fafc"}}>
+        <div style={{fontWeight:"600",marginBottom:10,color:"#374151"}}>學生身份 Student Identity</div>
+        <div style={{display:"flex",gap:12,flexWrap:"wrap"}}>
+          <div style={{flex:1,minWidth:140}}>
+            <label style={{fontSize:12,color:"#6b7280"}}>班級 Class（選填）</label>
+            <select value={cls} onChange={e=>setCls(e.target.value)} style={{display:"block",width:"100%",marginTop:4,padding:"7px 10px",borderRadius:6,border:"1px solid #d1d5db",fontSize:14}}>
+              <option value="">— 選擇班級 —</option>
+              {classes.map(c=><option key={c}>{c}</option>)}
+            </select>
+          </div>
+          <div style={{flex:1,minWidth:140}}>
+            <label style={{fontSize:12,color:"#6b7280"}}>學號 Student ID（選填）</label>
+            <input value={sid} onChange={e=>setSid(e.target.value)} placeholder="e.g. B11234567"
+              style={{display:"block",width:"100%",marginTop:4,padding:"7px 10px",borderRadius:6,border:"1px solid #d1d5db",fontSize:14}}/>
+          </div>
+        </div>
+        {!sid.trim()&&<div style={{fontSize:12,color:"#f59e0b",marginTop:8}}>⚠️ 未輸入學號時，完成記錄不會儲存。</div>}
+      </div>
+      <div style={{fontWeight:"600",color:"#374151",marginBottom:10}}>可用練習 Available Exercises</div>
+      {available.length===0
+        ?<div style={{textAlign:"center",padding:30,color:"#9ca3af",border:"2px dashed #e5e7eb",borderRadius:8}}>暫無可用練習。No exercises available yet.</div>
+        :available.map(ex=>(
+          <div key={ex.id} style={{...CARD,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div>
+              <div style={{fontWeight:"600",color:"#1e1b4b"}}>{ex.name}</div>
+              <div style={{fontSize:12,color:"#6b7280",marginTop:2}}>{ex.sentences.length} 個句子 sentences</div>
+            </div>
+            <button onClick={()=>setActiveEx(ex)} style={B()}>開始 Start →</button>
+          </div>
+        ))}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// EXERCISE PLAYER
+// ═══════════════════════════════════════════════════════════════════
+function ExercisePlayer({exercise,onFinish,onBack}) {
+  const [idx,setIdx]=useState(0); const [inputs,setInputs]=useState({});
+  const [feedback,setFeedback]=useState(null); const [wrongIdxs,setWrongIdxs]=useState(new Set());
+  const [rate,setRate]=useState(1); const correctRef=useRef(0); const inputRefs=useRef({});
+  const total=exercise.sentences.length; const sent=exercise.sentences[idx];
+  const tokens=tokenize(sent.text); const wordTokens=tokens.filter(t=>t.isWord);
+
+  useEffect(()=>{ setInputs({}); setFeedback(null); setWrongIdxs(new Set()); inputRefs.current={}; },[idx]);
+  useEffect(()=>()=>{ if("speechSynthesis" in window) speechSynthesis.cancel(); },[]);
+  useEffect(()=>{ const r=inputRefs.current[0]; if(r) r.focus(); },[idx]);
+
+  const speak=()=>{ if(!("speechSynthesis" in window)) return;
+    const u=new SpeechSynthesisUtterance(sent.text); u.rate=rate; u.lang="en-US";
+    speechSynthesis.cancel(); speechSynthesis.speak(u); };
+  const setVal=(wi,val)=>{ setInputs(p=>({...p,[wi]:val})); setFeedback(null);
+    setWrongIdxs(p=>{const n=new Set(p);n.delete(wi);return n;}); };
+  const handleKey=(e,wi)=>{ if(e.key==="Enter"){e.preventDefault();check();return;}
+    if(e.key==="Tab"){e.preventDefault();const r=inputRefs.current[wi+1];if(r)r.focus();} };
+  const check=()=>{ const wrong=new Set();
+    wordTokens.forEach((tok,wi)=>{if(normalize(inputs[wi]||"")!==normalize(tok.val))wrong.add(wi);});
+    if(wrong.size===0){setFeedback("ok");correctRef.current+=1;}
+    else{setFeedback("err");setWrongIdxs(wrong);const f=Math.min(...wrong);if(inputRefs.current[f])inputRefs.current[f].focus();} };
+  const next=()=>{ if(idx+1>=total) onFinish(`${correctRef.current}/${total}`); else setIdx(i=>i+1); };
+  const allFilled=wordTokens.every((_,wi)=>(inputs[wi]||"").trim()!=="");
+  const pct=(idx/total)*100;
+
+  let wordIdx=0;
+  const renderedTokens=tokens.map((tok,ti)=>{
+    if(!tok.isWord) return <span key={ti} style={{fontSize:16,color:"#374151",userSelect:"none"}}>{tok.val}</span>;
+    const wi=wordIdx++; const cw=Math.max(tok.val.length,3);
+    const isWrong=wrongIdxs.has(wi),isOk=feedback==="ok";
+    let bc="#6366f1",bg="#fff";
+    if(isOk){bc="#22c55e";bg="#f0fdf4";}
+    if(isWrong){bc="#ef4444";bg="#fef2f2";}
+    return <input key={ti} ref={el=>{inputRefs.current[wi]=el;}} value={inputs[wi]||""}
+      onChange={e=>setVal(wi,e.target.value)} onKeyDown={e=>handleKey(e,wi)} disabled={feedback==="ok"}
+      placeholder={"_".repeat(Math.min(cw,8))}
+      style={{width:`${cw*12+20}px`,padding:"4px 6px",border:`2px solid ${bc}`,borderRadius:5,
+        fontSize:15,background:bg,outline:"none",textAlign:"center",transition:"border-color .15s,background .15s"}}/>;
+  });
+
+  return (
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+        <button onClick={onBack} style={{background:"none",border:"1px solid #d1d5db",borderRadius:6,padding:"6px 12px",cursor:"pointer",fontSize:13}}>← 返回 Back</button>
+        <span style={{fontWeight:"600",color:"#4f46e5",fontSize:15}}>{exercise.name}</span>
+        <span style={{fontSize:13,color:"#6b7280"}}>✓ {correctRef.current} / {total}</span>
+      </div>
+      <div style={{background:"#e5e7eb",borderRadius:99,height:7,marginBottom:6}}>
+        <div style={{background:"#4f46e5",height:"100%",borderRadius:99,width:`${pct}%`,transition:"width .3s"}}/>
+      </div>
+      <div style={{textAlign:"center",fontSize:12,color:"#9ca3af",marginBottom:16}}>
+        第 {idx+1} 句，共 {total} 句 · Sentence {idx+1} of {total}
+      </div>
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16}}>
+        <button onClick={speak} style={B("#0ea5e9",{padding:"7px 14px"})}>🔊 Play</button>
+        <input type="range" min={0.5} max={1.5} step={0.1} value={rate} onChange={e=>setRate(+e.target.value)} style={{flex:1}}/>
+        <span style={{fontSize:12,color:"#6b7280",minWidth:32}}>{rate}×</span>
+      </div>
+      <div style={{...CARD,background:"#f8fafc",padding:"16px 18px"}}>
+        <div style={{fontSize:12,color:"#6b7280",marginBottom:10}}>
+          聽音檔，填入所有空格。Listen and fill in all blanks. <span style={{color:"#9ca3af"}}>(Enter 確認 · Tab 跳格)</span>
+        </div>
+        <div style={{display:"flex",flexWrap:"wrap",gap:"6px 4px",alignItems:"center",lineHeight:2.4}}>
+          {renderedTokens}
+        </div>
+      </div>
+      {feedback==="ok"&&<div style={{background:"#dcfce7",border:"1px solid #86efac",borderRadius:8,padding:"9px 14px",marginBottom:12,color:"#166534",fontWeight:"500"}}>✅ 全部正確！Correct!</div>}
+      {feedback==="err"&&<div style={{background:"#fee2e2",border:"1px solid #fca5a5",borderRadius:8,padding:"9px 14px",marginBottom:12,color:"#991b1b"}}>❌ {wrongIdxs.size} 個空格有誤（紅色）。{wrongIdxs.size} blank{wrongIdxs.size>1?"s":""} incorrect.</div>}
+      <div style={{display:"flex",gap:10}}>
+        {feedback!=="ok"&&<button onClick={check} disabled={!allFilled} style={{...B(allFilled?"#4f46e5":"#9ca3af"),opacity:allFilled?1:.65,cursor:allFilled?"pointer":"not-allowed"}}>✓ 確認 Check</button>}
+        {feedback==="ok"&&<button onClick={next} style={B("#22c55e")}>{idx+1>=total?"🏁 完成 Finish":"下一句 Next →"}</button>}
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TEACHER AREA
+// ═══════════════════════════════════════════════════════════════════
+function TeacherArea({classes,updCls,exercises,updEx}) {
+  const [authed,setAuthed]=useState(false); const [pw,setPw]=useState("");
+  const [section,setSection]=useState("classes"); const [newCls,setNewCls]=useState("");
+  const [exName,setExName]=useState(""); const [passage,setPassage]=useState("");
+  const [preview,setPreview]=useState(null); const [busy,setBusy]=useState(false); const [err,setErr]=useState("");
+
+  const login=()=>{ if(pw===TEACHER_PW){setAuthed(true);setPw("");}else setErr("密碼錯誤 Wrong password."); };
+  if(!authed) return (
+    <div style={{maxWidth:320,margin:"40px auto",textAlign:"center"}}>
+      <div style={{fontSize:44,marginBottom:10}}>🔒</div>
+      <h3 style={{margin:"0 0 14px",color:"#374151"}}>教師登入 Teacher Login</h3>
+      <input type="password" value={pw} onChange={e=>{setPw(e.target.value);setErr("");}}
+        onKeyDown={e=>e.key==="Enter"&&login()} placeholder="Enter password"
+        style={{display:"block",width:"100%",padding:"9px 12px",borderRadius:8,border:"1px solid #d1d5db",fontSize:14,marginBottom:8}}/>
+      {err&&<div style={{color:"#dc2626",fontSize:13,marginBottom:6}}>{err}</div>}
+      <button onClick={login} style={{...B(),width:"100%",padding:10}}>登入 Login</button>
+      <div style={{fontSize:12,color:"#9ca3af",marginTop:10}}>預設密碼 Default: teacher123</div>
+    </div>
+  );
+
+  const addCls=()=>{ if(newCls.trim()&&!classes.includes(newCls.trim())){updCls([...classes,newCls.trim()]);setNewCls("");} };
+  const process=async()=>{
+    if(!exName.trim()||!passage.trim()) return;
+    setBusy(true);setErr("");setPreview(null);
+    try{ const sents=splitSentences(passage); const trans=await apiTranslate(sents);
+      setPreview(sents.map((s,i)=>({text:s,translation:trans[i]||""})));
+    }catch(e){setErr("翻譯失敗: "+e.message);}
+    setBusy(false);
+  };
+  const saveEx=()=>{ if(!preview) return;
+    updEx([...exercises,{id:Date.now().toString(),name:exName.trim(),sentences:preview,available:true}]);
+    setExName("");setPassage("");setPreview(null); };
+  const toggleEx=id=>updEx(exercises.map(e=>e.id===id?{...e,available:!e.available}:e));
+  const deleteEx=id=>updEx(exercises.filter(e=>e.id!==id));
+  const updatePrev=(i,f,v)=>{const p=[...preview];p[i]={...p[i],[f]:v};setPreview(p);};
+
+  return (
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+        <div style={{display:"flex",gap:8}}>
+          {[["classes","🏫 班級管理"],["exercises","📝 練習管理"]].map(([k,l])=>(
+            <button key={k} onClick={()=>setSection(k)} style={{padding:"7px 14px",border:"none",borderRadius:6,cursor:"pointer",fontSize:13,
+              background:section===k?"#4f46e5":"#e5e7eb",color:section===k?"#fff":"#374151",fontWeight:section===k?"700":"400"}}>{l}</button>
+          ))}
+        </div>
+        <button onClick={()=>setAuthed(false)} style={{padding:"6px 12px",background:"none",border:"1px solid #d1d5db",borderRadius:6,cursor:"pointer",fontSize:12}}>🚪 登出</button>
+      </div>
+      {section==="classes"&&(
+        <div>
+          <div style={{display:"flex",gap:8,marginBottom:14}}>
+            <input value={newCls} onChange={e=>setNewCls(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addCls()}
+              placeholder="新班級名稱 New class name"
+              style={{flex:1,padding:"8px 12px",borderRadius:6,border:"1px solid #d1d5db",fontSize:14}}/>
+            <button onClick={addCls} style={B()}>+ 新增</button>
+          </div>
+          {classes.length===0
+            ?<div style={{textAlign:"center",padding:20,color:"#9ca3af"}}>尚無班級。No classes yet.</div>
+            :classes.map(c=>(
+              <div key={c} style={{...CARD,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span style={{fontWeight:"500"}}>🏫 {c}</span>
+                <button onClick={()=>updCls(classes.filter(x=>x!==c))} style={{padding:"5px 10px",background:"#fee2e2",color:"#dc2626",border:"none",borderRadius:6,cursor:"pointer",fontSize:13}}>🗑 刪除</button>
+              </div>
+            ))}
+        </div>
+      )}
+      {section==="exercises"&&(
+        <div>
+          <div style={{...CARD,background:"#f8fafc"}}>
+            <div style={{fontWeight:"600",marginBottom:10}}>➕ 新增練習 Create New Exercise</div>
+            <input value={exName} onChange={e=>setExName(e.target.value)} placeholder="練習名稱 Exercise name"
+              style={{display:"block",width:"100%",padding:"8px 12px",borderRadius:6,border:"1px solid #d1d5db",fontSize:14,marginBottom:8}}/>
+            <textarea value={passage} onChange={e=>setPassage(e.target.value)} rows={5} placeholder="貼入文章 Paste passage…"
+              style={{display:"block",width:"100%",padding:"8px 12px",borderRadius:6,border:"1px solid #d1d5db",fontSize:14,marginBottom:8,resize:"vertical"}}/>
+            <button onClick={process} disabled={busy||!exName.trim()||!passage.trim()}
+              style={{...B(busy?"#9ca3af":"#4f46e5"),cursor:busy?"not-allowed":"pointer"}}>
+              {busy?"⏳ 翻譯中 Translating…":"🔄 分句並翻譯 Process & Translate"}
+            </button>
+            {err&&<div style={{color:"#dc2626",fontSize:13,marginTop:8}}>{err}</div>}
+          </div>
+          {preview&&(
+            <div style={CARD}>
+              <div style={{fontWeight:"600",marginBottom:10}}>預覽 — {preview.length} 句 <span style={{fontSize:12,color:"#6b7280",fontWeight:"400"}}>(翻譯可編輯)</span></div>
+              {preview.map((s,i)=>(
+                <div key={i} style={{marginBottom:8,padding:"8px 12px",background:"#f8fafc",borderRadius:6,border:"1px solid #e2e8f0"}}>
+                  <div style={{fontSize:14,marginBottom:5}}><strong>{i+1}.</strong> {s.text}</div>
+                  <input value={s.translation} onChange={e=>updatePrev(i,"translation",e.target.value)}
+                    style={{width:"100%",padding:"5px 9px",borderRadius:5,border:"1px solid #fde68a",background:"#fefce8",fontSize:13,color:"#92400e"}}/>
+                </div>
+              ))}
+              <button onClick={saveEx} style={{...B("#22c55e"),marginTop:6}}>💾 儲存 Save</button>
+            </div>
+          )}
+          {exercises.length>0&&(
+            <div style={{marginTop:16}}>
+              <div style={{fontWeight:"600",marginBottom:10}}>現有練習 Existing Exercises</div>
+              {exercises.map(ex=>(
+                <div key={ex.id} style={{...CARD,display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
+                  <div><div style={{fontWeight:"500"}}>{ex.name}</div><div style={{fontSize:12,color:"#6b7280"}}>{ex.sentences.length} 個句子</div></div>
+                  <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                    <button onClick={()=>toggleEx(ex.id)} style={{padding:"5px 12px",border:"none",borderRadius:6,cursor:"pointer",fontSize:13,
+                      background:ex.available?"#dcfce7":"#f3f4f6",color:ex.available?"#166534":"#6b7280",fontWeight:"500"}}>
+                      {ex.available?"✅ 開放":"⬜ 關閉"}</button>
+                    <button onClick={()=>deleteEx(ex.id)} style={{padding:"5px 10px",background:"#fee2e2",color:"#dc2626",border:"none",borderRadius:6,cursor:"pointer",fontSize:13}}>🗑 刪除</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// LEARNING LOGS
+// ═══════════════════════════════════════════════════════════════════
+function LogsArea({logs}) {
+  const [col,setCol]=useState("timestamp"); const [asc,setAsc]=useState(false);
+  const COLS=[{k:"classId",l:"班級"},{k:"studentId",l:"學號"},{k:"exerciseName",l:"練習"},{k:"timestamp",l:"時間"},{k:"score",l:"分數"}];
+  const sorted=[...logs].sort((a,b)=>{ const av=a[col]||"",bv=b[col]||""; return asc?av.localeCompare(bv):bv.localeCompare(av); });
+  const toggleSort=k=>{ if(col===k)setAsc(a=>!a); else{setCol(k);setAsc(true);} };
+  return (
+    <div>
+      <div style={{fontWeight:"600",marginBottom:12}}>學習記錄 Learning Logs <span style={{fontWeight:"400",color:"#6b7280",fontSize:13}}>— {logs.length} 筆</span></div>
+      {logs.length===0
+        ?<div style={{textAlign:"center",padding:32,color:"#9ca3af",border:"2px dashed #e5e7eb",borderRadius:8}}>尚無記錄。No records yet.</div>
+        :<div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:14}}>
+            <thead><tr style={{background:"#f1f5f9"}}>
+              {COLS.map(c=>(
+                <th key={c.k} onClick={()=>toggleSort(c.k)} style={{padding:"9px 12px",textAlign:"left",cursor:"pointer",userSelect:"none",
+                  borderBottom:"2px solid #e2e8f0",whiteSpace:"nowrap",color:col===c.k?"#4f46e5":"#374151",fontWeight:"600"}}>
+                  {c.l} {col===c.k?(asc?"↑":"↓"):<span style={{color:"#cbd5e1"}}>⇅</span>}
+                </th>
+              ))}
+            </tr></thead>
+            <tbody>{sorted.map((log,i)=>(
+              <tr key={i} style={{borderBottom:"1px solid #f1f5f9",background:i%2===0?"#fff":"#f9fafb"}}>
+                <td style={{padding:"8px 12px"}}>{log.classId}</td>
+                <td style={{padding:"8px 12px"}}>{log.studentId}</td>
+                <td style={{padding:"8px 12px"}}>{log.exerciseName}</td>
+                <td style={{padding:"8px 12px",whiteSpace:"nowrap",fontSize:13}}>{log.timestamp}</td>
+                <td style={{padding:"8px 12px",fontWeight:"700",color:"#4f46e5"}}>{log.score}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      }
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
